@@ -14,7 +14,9 @@ import zipfile
 URL = "https://www.federalreserve.gov/econres/files/scfp2025excel.zip"
 ROOT = Path(__file__).resolve().parents[1]
 
-def prepare(raw):
+def prepare(raw, measure="FIN"):
+    if measure not in ("FIN", "INCOME"):
+        raise ValueError("Unsupported SCF aggregate")
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         with archive.open("SCFP2025.csv") as source:
             rows = list(csv.DictReader(io.TextIOWrapper(source)))
@@ -24,9 +26,9 @@ def prepare(raw):
     weights = collections.defaultdict(list)
     for row in rows:
         identifier, implicate = int(row["YY1"]), int(row["Y1"]) % 10
-        value, weight = float(row["FIN"]), float(row["WGT"])
-        if not math.isfinite(value) or value < 0:
-            raise ValueError("Missing, nonfinite, or negative FIN: investigate rather than silently alter")
+        value, weight = float(row[measure]), float(row["WGT"])
+        if not math.isfinite(value) or (measure == "FIN" and value < 0):
+            raise ValueError(f"Invalid {measure}: missing/nonfinite value or negative financial assets; investigate rather than silently alter")
         if not math.isfinite(weight) or weight <= 0:
             raise ValueError("Invalid survey weight")
         if implicate in households[identifier]:
@@ -49,21 +51,28 @@ def prepare(raw):
         points.append([value, running / total])
     points[-1][1] = 1.0
     assert all(a[0] < b[0] and a[1] <= b[1] for a,b in zip(points,points[1:]))
-    thresholds = {str(p): points[bisect.bisect_left([v[1] for v in points],p/100)][0] for p in (50,75,90,95,99)}
+    thresholds = {str(p): points[bisect.bisect_left([v[1] for v in points],p/100)][0] for p in ((25,50,75,90,95,99) if measure == "INCOME" else (50,75,90,95,99))}
     # Independent calculation: average five separately normalized CDFs.
     for value in thresholds.values():
         independent = math.fsum(math.fsum(w for x,w in entries if x<=value)/math.fsum(w for x,w in entries) for entries in per_implicate.values())/5
         pooled = points[bisect.bisect_right([x[0] for x in points],value)-1][1]
         assert abs(independent-pooled) < 1e-10
-    return dict(id="us-household-financial-assets",title="U.S. household financial assets",geography="United States",surveyYear=2025,currency="USD",units="2025 dollars",populationUnit="households (SCF primary economic units)",measure="Gross financial assets",definition="Official FIN: transaction accounts, CDs, pooled investment funds, stocks, bonds, retirement accounts, savings bonds, cash-value life insurance, other managed assets and other financial assets. Excludes nonfinancial assets; debts are not subtracted.",source=dict(name="Federal Reserve Survey of Consumer Finances",url="https://www.federalreserve.gov/econres/scfindex.htm",download=URL,sha256=hashlib.sha256(raw).hexdigest()),method="Weighted empirical CDF, at or below; average of five separately normalized weighted CDFs using extract WGT (already X42001/5). No interpolation across point masses.",households=len(households),observations=len(rows),thresholds=thresholds,points=points)
+    result = dict(id="us-household-financial-assets",title="U.S. household financial assets",geography="United States",surveyYear=2025,currency="USD",units="2025 dollars",populationUnit="households (SCF primary economic units)",measure="Gross financial assets",definition="Official FIN: transaction accounts, CDs, pooled investment funds, stocks, bonds, retirement accounts, savings bonds, cash-value life insurance, other managed assets and other financial assets. Excludes nonfinancial assets; debts are not subtracted.",source=dict(name="Federal Reserve Survey of Consumer Finances",url="https://www.federalreserve.gov/econres/scfindex.htm",download=URL,sha256=hashlib.sha256(raw).hexdigest()),method="Weighted empirical CDF, at or below; average of five separately normalized weighted CDFs using extract WGT (already X42001/5). No interpolation across point masses.",households=len(households),observations=len(rows),thresholds=thresholds,points=points)
+
+    if measure == "INCOME":
+        result.update(id="us-household-income", title="U.S. annual household income", measure="Total annual household income", referenceYear=2024, variable="INCOME", definition="Official SCF INCOME: total household income for calendar year 2024 before taxes, including the specified IRA and tax-deferred pension withdrawals, adjusted to 2025 dollars. The official aggregate floors base income at zero; no additional clipping is applied here.")
+    return result
 
 if __name__ == "__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--archive",type=Path,help="Use an already downloaded official ZIP")
-    parser.add_argument("--output",type=Path,default=ROOT/"data/us-financial-assets.json")
+    parser.add_argument("--measure", choices=("FIN", "INCOME"), default="FIN")
+    parser.add_argument("--output",type=Path)
     args=parser.parse_args()
     raw=args.archive.read_bytes() if args.archive else subprocess.check_output(["curl", "--fail", "--silent", "--show-error", "--location", "--max-time", "60", URL])
-    result=prepare(raw)
+    result=prepare(raw, args.measure)
+    if args.output is None:
+        args.output=ROOT/("data/us-household-income.json" if args.measure == "INCOME" else "data/us-financial-assets.json")
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(result,separators=(",",":"))+"\n")
     print(json.dumps({k:result[k] for k in ("households","observations","thresholds","source")},indent=2))
